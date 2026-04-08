@@ -26,6 +26,12 @@ type TextContentBlock = {
 };
 
 type SummarizeContext = Pick<ExtensionCommandContext, "sessionManager" | "hasUI" | "ui" | "model" | "modelRegistry">;
+type ModelPickResult =
+  | { ok: true; model: Model<Api>; apiKey?: string; headers?: Record<string, string> }
+  | { ok: false; reason: string };
+type SessionSummaryResult =
+  | { ok: true; summary: string }
+  | { ok: false; reason: string };
 
 async function pickCheapModel(ctx: {
   model: Model<Api> | null;
@@ -33,17 +39,27 @@ async function pickCheapModel(ctx: {
     find: (p: string, id: string) => Model<Api> | undefined;
     getApiKeyAndHeaders: (m: Model<Api>) => Promise<{ ok: true; apiKey?: string; headers?: Record<string, string> } | { ok: false; error: string }>;
   };
-}): Promise<{ model: Model<Api>; apiKey?: string; headers?: Record<string, string> } | null> {
+}): Promise<ModelPickResult> {
+  let haikuFailure = `anthropic/${HAIKU_MODEL_ID} is not available`;
   const haiku = ctx.modelRegistry.find("anthropic", HAIKU_MODEL_ID);
   if (haiku) {
     const auth = await ctx.modelRegistry.getApiKeyAndHeaders(haiku);
-    if (auth.ok) return { model: haiku, apiKey: auth.apiKey, headers: auth.headers };
+    if ("error" in auth) {
+      haikuFailure = `anthropic/${HAIKU_MODEL_ID} auth failed: ${auth.error}`;
+    } else {
+      return { ok: true, model: haiku, apiKey: auth.apiKey, headers: auth.headers };
+    }
   }
+
   if (ctx.model) {
     const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
-    if (auth.ok) return { model: ctx.model, apiKey: auth.apiKey, headers: auth.headers };
+    if ("error" in auth) {
+      return { ok: false, reason: `${haikuFailure}. Current model ${ctx.model.provider}/${ctx.model.id} auth failed: ${auth.error}` };
+    }
+    return { ok: true, model: ctx.model, apiKey: auth.apiKey, headers: auth.headers };
   }
-  return null;
+
+  return { ok: false, reason: `${haikuFailure}. No current model is selected for fallback` };
 }
 
 function extractText(content: unknown): string {
@@ -108,12 +124,12 @@ function preserveSkillPrefix(currentName: string | undefined, summary: string): 
   return prefix ? `${prefix} ${summary}` : summary;
 }
 
-async function summarizeSession(ctx: SummarizeContext): Promise<string | null> {
+async function summarizeSession(ctx: SummarizeContext): Promise<SessionSummaryResult> {
   const conversationText = buildConversationText(ctx.sessionManager.getBranch() as SessionBranchEntry[]);
-  if (!conversationText) return null;
+  if (!conversationText) return { ok: false, reason: "No conversation text found" };
 
   const cheap = await pickCheapModel(ctx);
-  if (!cheap) return null;
+  if ("reason" in cheap) return { ok: false, reason: cheap.reason };
 
   const response = await complete(
     cheap.model,
@@ -130,7 +146,10 @@ async function summarizeSession(ctx: SummarizeContext): Promise<string | null> {
     { apiKey: cheap.apiKey, headers: cheap.headers },
   );
 
-  return extractSummary(response);
+  const summary = extractSummary(response);
+  if (!summary) return { ok: false, reason: "The model returned an empty session title" };
+
+  return { ok: true, summary };
 }
 
 export default function (pi: ExtensionAPI) {
@@ -151,17 +170,17 @@ export default function (pi: ExtensionAPI) {
     if (ctx.hasUI) ctx.ui.notify("Summarizing session...", "info");
 
     try {
-      const summary = await summarizeSession(ctx);
-      if (!summary) {
-        if (ctx.hasUI) ctx.ui.notify("Couldn't summarize this session", "warning");
+      const result = await summarizeSession(ctx);
+      if ("reason" in result) {
+        if (ctx.hasUI) ctx.ui.notify(result.reason, "warning");
         return;
       }
 
-      const nextName = preserveSkillPrefix(pi.getSessionName(), summary);
+      const nextName = preserveSkillPrefix(pi.getSessionName(), result.summary);
       setSessionName(nextName);
       if (ctx.hasUI) ctx.ui.notify(`Session renamed: ${nextName}`, "info");
-    } catch {
-      if (ctx.hasUI) ctx.ui.notify("Failed to summarize session", "warning");
+    } catch (error) {
+      if (ctx.hasUI) ctx.ui.notify(error instanceof Error ? error.message : "Failed to summarize session", "warning");
     }
   };
 
@@ -192,7 +211,7 @@ export default function (pi: ExtensionAPI) {
 
     // Summarize in the background with a cheap model
     const cheap = await pickCheapModel(ctx);
-    if (!cheap) return;
+    if ("reason" in cheap) return;
 
     try {
       const response = await complete(
