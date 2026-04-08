@@ -24,8 +24,9 @@ The name is a skill prefix plus a 5–10 word summary of your prompt:
 
 1. Detects when you start a session with `/skill:name your prompt here` or `/skill name your prompt here`
 2. Immediately sets a temporary name with the first 60 characters
-3. Calls a cheap model (Codex mini → Haiku → current model) to summarize your prompt in 5–10 words
+3. Calls a cheap model (Haiku → current model) to summarize your prompt in 5–10 words
 4. Updates the session name with the AI summary, prefixed by the skill name
+5. Lets you re-summarize the current conversation later with `/summarize-session` or `Ctrl+Shift+R`
 
 The summarization happens in the background — no delay to your workflow. If the model call fails, the truncated name is kept as a fallback.
 
@@ -50,7 +51,9 @@ pi install git:github.com/HazAT/pi-smart-sessions
 ## Tips
 
 - **Existing sessions** can be renamed manually with **Ctrl+R** in the session selector
+- Use `/summarize-session` or **Ctrl+Shift+R** to generate a new AI title from the current conversation
 - The extension only names the first skill-based prompt per session — it won't overwrite names you set yourself
+- Works with skill invocations that have no custom prompt, like `/skill:gh-address-comments`
 - Works with any skill, not just brainstorm
 
 ## License

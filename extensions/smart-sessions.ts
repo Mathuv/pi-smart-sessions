@@ -1,12 +1,31 @@
 import { complete, type Model, type Api } from "@mariozechner/pi-ai";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
 
 const skillPattern = /^\/skill(?:\:| +)(\S+)(?: +([\s\S]*))?$/;
 
 const SUMMARY_PROMPT =
   "Summarize the user's request in 5-10 words max. Output ONLY the summary, nothing else. No quotes, no punctuation at the end.";
+const SESSION_SUMMARY_PROMPT =
+  "Summarize this conversation as a short session title in 5-10 words max. Focus on the main task, decision, or outcome. Output ONLY the title, nothing else. No quotes, no punctuation at the end.";
 
 const HAIKU_MODEL_ID = "claude-haiku-4-5";
+const MAX_CONVERSATION_CHARS = 12_000;
+
+type SessionBranchEntry = {
+  type: string;
+  summary?: string;
+  message?: {
+    role?: string;
+    content?: unknown;
+  };
+};
+
+type TextContentBlock = {
+  type?: string;
+  text?: string;
+};
+
+type SummarizeContext = Pick<ExtensionCommandContext, "sessionManager" | "hasUI" | "ui" | "model" | "modelRegistry">;
 
 async function pickCheapModel(ctx: {
   model: Model<Api> | null;
@@ -27,30 +46,149 @@ async function pickCheapModel(ctx: {
   return null;
 }
 
+function extractText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+
+  return content
+    .filter((block): block is TextContentBlock => !!block && typeof block === "object")
+    .filter((block) => block.type === "text" && typeof block.text === "string")
+    .map((block) => block.text)
+    .join("\n")
+    .trim();
+}
+
+function trimConversation(text: string): string {
+  if (text.length <= MAX_CONVERSATION_CHARS) return text;
+
+  const separator = "\n\n[Earlier conversation omitted for brevity]\n\n";
+  const headLength = Math.floor((MAX_CONVERSATION_CHARS - separator.length) * 0.4);
+  const tailLength = MAX_CONVERSATION_CHARS - separator.length - headLength;
+  return `${text.slice(0, headLength).trimEnd()}${separator}${text.slice(-tailLength).trimStart()}`;
+}
+
+function buildConversationText(entries: SessionBranchEntry[]): string {
+  const sections: string[] = [];
+
+  for (const entry of entries) {
+    if (entry.type === "compaction" && typeof entry.summary === "string" && entry.summary.trim()) {
+      sections.push(`Earlier summary: ${entry.summary.trim()}`);
+      continue;
+    }
+
+    if (entry.type === "branch_summary" && typeof entry.summary === "string" && entry.summary.trim()) {
+      sections.push(`Branch summary: ${entry.summary.trim()}`);
+      continue;
+    }
+
+    if (entry.type !== "message") continue;
+
+    const role = entry.message?.role;
+    if (role !== "user" && role !== "assistant") continue;
+
+    const text = extractText(entry.message?.content);
+    if (!text) continue;
+
+    sections.push(`${role === "user" ? "User" : "Assistant"}: ${text}`);
+  }
+
+  return trimConversation(sections.join("\n\n").trim());
+}
+
+function extractSummary(response: { content: Array<{ type: string; text?: string }> }): string {
+  return response.content
+    .filter((c): c is { type: "text"; text: string } => c.type === "text" && typeof c.text === "string")
+    .map((c) => c.text)
+    .join("")
+    .trim();
+}
+
+function preserveSkillPrefix(currentName: string | undefined, summary: string): string {
+  const prefix = currentName?.match(/^(\[[^\]]+\])(?:\s|$)/)?.[1];
+  return prefix ? `${prefix} ${summary}` : summary;
+}
+
+async function summarizeSession(ctx: SummarizeContext): Promise<string | null> {
+  const conversationText = buildConversationText(ctx.sessionManager.getBranch() as SessionBranchEntry[]);
+  if (!conversationText) return null;
+
+  const cheap = await pickCheapModel(ctx);
+  if (!cheap) return null;
+
+  const response = await complete(
+    cheap.model,
+    {
+      systemPrompt: SESSION_SUMMARY_PROMPT,
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: `<conversation>\n${conversationText}\n</conversation>` }],
+          timestamp: Date.now(),
+        },
+      ],
+    },
+    { apiKey: cheap.apiKey, headers: cheap.headers },
+  );
+
+  return extractSummary(response);
+}
+
 export default function (pi: ExtensionAPI) {
   let named = false;
+
+  const setSessionName = (name: string) => {
+    pi.setSessionName(name);
+    named = true;
+  };
+
+  const summarizeAndRenameSession = async (ctx: SummarizeContext) => {
+    const conversationText = buildConversationText(ctx.sessionManager.getBranch() as SessionBranchEntry[]);
+    if (!conversationText) {
+      if (ctx.hasUI) ctx.ui.notify("No conversation text found", "warning");
+      return;
+    }
+
+    if (ctx.hasUI) ctx.ui.notify("Summarizing session...", "info");
+
+    try {
+      const summary = await summarizeSession(ctx);
+      if (!summary) {
+        if (ctx.hasUI) ctx.ui.notify("Couldn't summarize this session", "warning");
+        return;
+      }
+
+      const nextName = preserveSkillPrefix(pi.getSessionName(), summary);
+      setSessionName(nextName);
+      if (ctx.hasUI) ctx.ui.notify(`Session renamed: ${nextName}`, "info");
+    } catch {
+      if (ctx.hasUI) ctx.ui.notify("Failed to summarize session", "warning");
+    }
+  };
 
   pi.on("session_start", () => {
     named = !!pi.getSessionName();
   });
 
   pi.on("input", async (event, ctx) => {
-    if (named) return;
+    if (named || pi.getSessionName()) {
+      named = true;
+      return;
+    }
 
     const match = event.text.match(skillPattern);
     if (!match) return;
 
     const skillName = match[1];
-    const userPrompt = match[2].trim();
+    const userPrompt = (match[2] ?? "").trim();
     named = true;
 
     if (!userPrompt) {
-      pi.setSessionName(`[${skillName}]`);
+      setSessionName(`[${skillName}]`);
       return;
     }
 
     // Set a temporary name immediately so something shows up
-    pi.setSessionName(`[${skillName}] ${userPrompt.slice(0, 60)}`);
+    setSessionName(`[${skillName}] ${userPrompt.slice(0, 60)}`);
 
     // Summarize in the background with a cheap model
     const cheap = await pickCheapModel(ctx);
@@ -66,17 +204,23 @@ export default function (pi: ExtensionAPI) {
         { apiKey: cheap.apiKey, headers: cheap.headers },
       );
 
-      const summary = response.content
-        .filter((c): c is { type: "text"; text: string } => c.type === "text")
-        .map((c) => c.text)
-        .join("")
-        .trim();
+      const summary = extractSummary(response);
 
       if (summary) {
-        pi.setSessionName(`[${skillName}] ${summary}`);
+        setSessionName(`[${skillName}] ${summary}`);
       }
     } catch {
       // Keep the truncated name, no big deal
     }
+  });
+
+  pi.registerCommand("summarize-session", {
+    description: "Summarize the current conversation and rename the session",
+    handler: async (_args, ctx) => summarizeAndRenameSession(ctx),
+  });
+
+  pi.registerShortcut("ctrl+shift+r", {
+    description: "Summarize the current conversation and rename the session",
+    handler: async (ctx) => summarizeAndRenameSession(ctx),
   });
 }
