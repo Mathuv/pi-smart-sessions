@@ -22,7 +22,7 @@ The name is a skill prefix plus a 5–10 word summary of your prompt:
 
 ## How it works
 
-1. Detects when you start a session with `/skill:name your prompt here`
+1. Detects when you start a session with `/skill:name your prompt here` or `/skill name your prompt here`
 2. Immediately sets a temporary name with the first 60 characters
 3. Calls a cheap model (Codex mini → Haiku → current model) to summarize your prompt in 5–10 words
 4. Updates the session name with the AI summary, prefixed by the skill name

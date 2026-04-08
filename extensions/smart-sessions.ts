@@ -1,7 +1,7 @@
 import { complete, type Model, type Api } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
-const skillPattern = /^\/skill:(\S+)\s*([\s\S]*)/;
+const skillPattern = /^\/skill(?:\:| +)(\S+)(?: +([\s\S]*))?$/;
 
 const SUMMARY_PROMPT =
   "Summarize the user's request in 5-10 words max. Output ONLY the summary, nothing else. No quotes, no punctuation at the end.";
