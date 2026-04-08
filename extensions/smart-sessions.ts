@@ -25,6 +25,13 @@ type TextContentBlock = {
   text?: string;
 };
 
+type SummaryContentBlock = {
+  type: string;
+  text?: string;
+  thinking?: string;
+  redacted?: boolean;
+};
+
 type SummarizeContext = Pick<ExtensionCommandContext, "sessionManager" | "hasUI" | "ui" | "model" | "modelRegistry">;
 type ModelPickResult =
   | { ok: true; model: Model<Api>; apiKey?: string; headers?: Record<string, string> }
@@ -32,6 +39,15 @@ type ModelPickResult =
 type SessionSummaryResult =
   | { ok: true; summary: string }
   | { ok: false; reason: string };
+
+type ResolvedAuth = {
+  apiKey?: string;
+  headers?: Record<string, string>;
+};
+
+function hasRequestAuth(auth: ResolvedAuth): boolean {
+  return !!auth.apiKey || !!(auth.headers && Object.keys(auth.headers).length > 0);
+}
 
 async function pickCheapModel(ctx: {
   model: Model<Api> | null;
@@ -46,8 +62,10 @@ async function pickCheapModel(ctx: {
     const auth = await ctx.modelRegistry.getApiKeyAndHeaders(haiku);
     if ("error" in auth) {
       haikuFailure = `anthropic/${HAIKU_MODEL_ID} auth failed: ${auth.error}`;
-    } else {
+    } else if (hasRequestAuth(auth)) {
       return { ok: true, model: haiku, apiKey: auth.apiKey, headers: auth.headers };
+    } else {
+      haikuFailure = `anthropic/${HAIKU_MODEL_ID} has no API key or auth headers`;
     }
   }
 
@@ -55,6 +73,9 @@ async function pickCheapModel(ctx: {
     const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
     if ("error" in auth) {
       return { ok: false, reason: `${haikuFailure}. Current model ${ctx.model.provider}/${ctx.model.id} auth failed: ${auth.error}` };
+    }
+    if (!hasRequestAuth(auth)) {
+      return { ok: false, reason: `${haikuFailure}. Current model ${ctx.model.provider}/${ctx.model.id} has no API key or auth headers` };
     }
     return { ok: true, model: ctx.model, apiKey: auth.apiKey, headers: auth.headers };
   }
@@ -111,12 +132,30 @@ function buildConversationText(entries: SessionBranchEntry[]): string {
   return trimConversation(sections.join("\n\n").trim());
 }
 
-function extractSummary(response: { content: Array<{ type: string; text?: string }> }): string {
+function extractSummary(response: { content: SummaryContentBlock[] }): string {
   return response.content
-    .filter((c): c is { type: "text"; text: string } => c.type === "text" && typeof c.text === "string")
+    .filter((c): c is SummaryContentBlock & { type: "text"; text: string } => c.type === "text" && typeof c.text === "string")
     .map((c) => c.text)
     .join("")
+    .replace(/\s+/g, " ")
     .trim();
+}
+
+function describeResponseContent(response: { content: SummaryContentBlock[] }): string {
+  const types = response.content.map((block) => {
+    if (block.type === "thinking") {
+      if (block.redacted) return "thinking:redacted";
+      const hasThinking = typeof block.thinking === "string" && block.thinking.trim().length > 0;
+      return hasThinking ? "thinking" : "thinking:empty";
+    }
+    if (block.type === "text") {
+      const hasText = typeof block.text === "string" && block.text.trim().length > 0;
+      return hasText ? "text" : "text:empty";
+    }
+    return block.type;
+  });
+
+  return types.length > 0 ? types.join(", ") : "none";
 }
 
 function preserveSkillPrefix(currentName: string | undefined, summary: string): string {
@@ -131,25 +170,47 @@ async function summarizeSession(ctx: SummarizeContext): Promise<SessionSummaryRe
   const cheap = await pickCheapModel(ctx);
   if ("reason" in cheap) return { ok: false, reason: cheap.reason };
 
+  const messages = [
+    {
+      role: "user" as const,
+      content: [{ type: "text" as const, text: `<conversation>\n${conversationText}\n</conversation>` }],
+      timestamp: Date.now(),
+    },
+  ];
+
   const response = await complete(
     cheap.model,
     {
       systemPrompt: SESSION_SUMMARY_PROMPT,
-      messages: [
-        {
-          role: "user",
-          content: [{ type: "text", text: `<conversation>\n${conversationText}\n</conversation>` }],
-          timestamp: Date.now(),
-        },
-      ],
+      messages,
     },
     { apiKey: cheap.apiKey, headers: cheap.headers },
   );
 
   const summary = extractSummary(response);
-  if (!summary) return { ok: false, reason: "The model returned an empty session title" };
+  if (summary) return { ok: true, summary };
 
-  return { ok: true, summary };
+  const retryResponse = await complete(
+    cheap.model,
+    {
+      systemPrompt: `${SESSION_SUMMARY_PROMPT} Reply with plain text only in a single short line.`,
+      messages,
+    },
+    {
+      apiKey: cheap.apiKey,
+      headers: cheap.headers,
+      reasoning: "minimal",
+      thinking: { enabled: false },
+    },
+  );
+
+  const retrySummary = extractSummary(retryResponse);
+  if (retrySummary) return { ok: true, summary: retrySummary };
+
+  return {
+    ok: false,
+    reason: `Model returned no usable title text (initial blocks: ${describeResponseContent(response)}; retry blocks: ${describeResponseContent(retryResponse)})`,
+  };
 }
 
 export default function (pi: ExtensionAPI) {
