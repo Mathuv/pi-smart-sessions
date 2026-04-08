@@ -1,4 +1,4 @@
-import { complete, type Model, type Api } from "@mariozechner/pi-ai";
+import { complete, type Model } from "@mariozechner/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
 
 const skillPattern = /^\/skill(?:\:| +)(\S+)(?: +([\s\S]*))?$/;
@@ -34,7 +34,7 @@ type SummaryContentBlock = {
 
 type SummarizeContext = Pick<ExtensionCommandContext, "sessionManager" | "hasUI" | "ui" | "model" | "modelRegistry">;
 type ModelPickResult =
-  | { ok: true; model: Model<Api>; apiKey?: string; headers?: Record<string, string> }
+  | { ok: true; model: Model<any>; apiKey?: string; headers?: Record<string, string> }
   | { ok: false; reason: string };
 type SessionSummaryResult =
   | { ok: true; summary: string }
@@ -49,13 +49,7 @@ function hasRequestAuth(auth: ResolvedAuth): boolean {
   return !!auth.apiKey || !!(auth.headers && Object.keys(auth.headers).length > 0);
 }
 
-async function pickCheapModel(ctx: {
-  model: Model<Api> | null;
-  modelRegistry: {
-    find: (p: string, id: string) => Model<Api> | undefined;
-    getApiKeyAndHeaders: (m: Model<Api>) => Promise<{ ok: true; apiKey?: string; headers?: Record<string, string> } | { ok: false; error: string }>;
-  };
-}): Promise<ModelPickResult> {
+async function pickCheapModel(ctx: Pick<SummarizeContext, "model" | "modelRegistry">): Promise<ModelPickResult> {
   let haikuFailure = `anthropic/${HAIKU_MODEL_ID} is not available`;
   const haiku = ctx.modelRegistry.find("anthropic", HAIKU_MODEL_ID);
   if (haiku) {
